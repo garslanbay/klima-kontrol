@@ -26,10 +26,11 @@
 
 **Not:** `Light` biti her paketle sabit `true` gönderildiğinde ekranı toggle'layıp yanlış görünüyordu → çözüm: `false` sabitlendi.
 
-## 3. Yazılım Mimarisi (main.c)
+## 3. Yazılım Mimarisi
 - **WiFi:** STA modu, mevcut ev/iş modemine bağlanıyor (SoftAP'ta ESP32-C3 klon kartın anten sorunu nedeniyle ağ yayınlanamadığı için STA moduna geçildi)
-- **Yerel kontrol:** ESP32 üzerinde `esp_http_server` ile basit web sayfası (AC/KAPAT, sıcaklık +/-, fan hızı, salınım butonları) — sadece aynı WiFi ağındayken çalışır
+- **Yerel kontrol:** ESP32 üzerinde `esp_http_server` ile basit web sayfası — sadece aynı WiFi ağındayken çalışır
 - **Uzaktan kontrol:** ThingSpeak entegrasyonu — ESP32, 20 saniyede bir kanalı okuyup değişiklik varsa IR komutu gönderiyor
+- **Görsel uzaktan arayüz:** GitHub Pages'te barındırılan statik sayfa, ThingSpeak Update API'sine yazıyor
 
 ## 4. ThingSpeak Kurulumu
 - **Kanal field'ları:**
@@ -37,33 +38,608 @@
   - `field2` = Sıcaklık (16-31)
   - `field3` = Fan (0=Auto, 2=Düşük, 3=Orta, 5=Yüksek)
   - `field4` = Salınım (0=Kapalı, 7=Açık)
-- ESP32 tarafı: `https://api.thingspeak.com/channels/<ID>/feeds/last.json?api_key=<READ_KEY>` adresini periyodik okuyor (cJSON ile parse)
-- Yazma (telefon/tarayıcı tarafı): `https://api.thingspeak.com/update?api_key=<WRITE_KEY>&field1=1&field2=24&field3=0&field4=0`
 - **Rate limit:** Ücretsiz hesapta minimum 15 saniyede bir güncelleme sınırı var
 
-## 5. Görsel Uzaktan Kontrol Arayüzü (GitHub Pages)
-- Statik HTML+JS sayfası, ThingSpeak Update API'sine doğrudan `fetch()` ile yazıyor
+## 5. GitHub Pages
 - **Yayın adresi:** `garslanbay.github.io/klima-kontrol`
 - Telefonda "Ana Ekrana Ekle" ile uygulama gibi kullanılabiliyor
 - **Test sonucu:** Butona basınca "Gonderildi (kayit #...)" mesajı geldi → ThingSpeak'e yazma **başarılı**
 
 ## 6. Şu An Doğrulanmamış / Bir Sonraki Kontrol
-- [ ] ESP32'nin ThingSpeak'ten okuyup **gerçekten klimaya IR komutu gönderdiği** henüz canlı test edilmedi (bilgisayar/seri monitör kapalıyken buton denendi). Bir sonraki seferde:
+- [ ] ESP32'nin ThingSpeak'ten okuyup **gerçekten klimaya IR komutu gönderdiği** henüz canlı test edilmedi. Bir sonraki seferde:
   1. ESP32'yi çalışır halde bırakıp (USB güç yeterli, bilgisayara bağlı olmasına gerek yok)
   2. GitHub Pages sayfasından bir komut gönderip
   3. Klimanın fiziksel olarak tepki verip vermediğini (en fazla 20 saniye içinde) gözlemlemek gerekiyor
 
 ## 7. Daha Önce Denenen Ama Şu An Kullanılmayan
-- **Mitsubishi136 protokolü** (iş yerindeki Mitsubishi Electric klima için, kumanda modeli: 001CP T7WE10714) — RX/TX tam doğrulandı (Power ve SwingV alanları gerçek cihazda test edildi), ancak proje şu an TCL klimaya odaklanmış durumda. İleride tekrar gerekirse bu protokol bilgisi de mevcut.
+- **Mitsubishi136 protokolü** (iş yerindeki Mitsubishi Electric klima için, kumanda modeli: 001CP T7WE10714) — RX/TX tam doğrulandı (Power ve SwingV alanları gerçek cihazda test edildi), ancak proje şu an TCL klimaya odaklanmış durumda.
 
-## 8. Kritik Sabitler / Bağlantı Bilgileri (kod içinde placeholder olarak duruyor, doldurulması gerekenler)
+---
+
+## 8. main/CMakeLists.txt
+
+```cmake
+idf_component_register(SRCS "main.c"
+                        INCLUDE_DIRS "."
+                        REQUIRES driver esp_wifi esp_netif nvs_flash esp_http_server esp_event esp_http_client json esp-tls)
+```
+
+---
+
+## 9. main.c (Tam Kod — Guncel Calisan Versiyon)
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "cJSON.h"
+#include "driver/rmt_tx.h"
+
+static const char *TAG = "IR_TCL112";
+
+// ================== KENDI MODEM BILGILERINIZ ==================
+#define WIFI_STA_SSID   "MODEM_ADINIZ"
+#define WIFI_STA_PASS   "MODEM_SIFRENIZ"
+
+// ================== THINGSPEAK BILGILERINIZ ==================
+#define THINGSPEAK_CHANNEL_ID   "KANAL_ID_NIZ"
+#define THINGSPEAK_READ_API_KEY "OKUMA_API_KEYINIZ"
+#define THINGSPEAK_POLL_INTERVAL_MS  20000   // 20 saniyede bir kontrol (rate limit icin guvenli)
+
+#define WIFI_CONNECTED_BIT BIT0
+static EventGroupHandle_t s_wifi_event_group;
+
+#define IR_RESOLUTION_HZ     1000000
+#define IR_TX_GPIO_NUM       5
+
+#define TCL_HDR_MARK    3000
+#define TCL_HDR_SPACE   1650
+#define TCL_BIT_MARK    500
+#define TCL_ONE_SPACE   1050
+#define TCL_ZERO_SPACE  325
+#define TCL_STATE_BYTES 14
+#define TCL_TOTAL_BITS  (TCL_STATE_BYTES * 8)
+
+#define TCL_MODE_HEAT 1
+#define TCL_MODE_DRY  2
+#define TCL_MODE_COOL 3
+#define TCL_MODE_FAN  7
+#define TCL_MODE_AUTO 8
+
+#define TCL_FAN_AUTO  0
+#define TCL_FAN_MIN   1
+#define TCL_FAN_LOW   2
+#define TCL_FAN_MED   3
+#define TCL_FAN_HIGH  5
+
+#define TCL_SWINGV_OFF      0
+#define TCL_SWINGV_HIGHEST  1
+#define TCL_SWINGV_HIGH     2
+#define TCL_SWINGV_MIDDLE   3
+#define TCL_SWINGV_LOW      4
+#define TCL_SWINGV_LOWEST   5
+#define TCL_SWINGV_ON       7
+
+static rmt_channel_handle_t tx_channel = NULL;
+static rmt_encoder_handle_t copy_encoder = NULL;
+
+typedef struct {
+    bool power;
+    int temp;
+    uint8_t fan;
+    uint8_t swingv;
+} ac_state_t;
+
+static ac_state_t g_ac_state = {
+    .power = false,
+    .temp = 24,
+    .fan = TCL_FAN_AUTO,
+    .swingv = TCL_SWINGV_OFF,
+};
+
+// =================================================================
+// TX: TCL112AC
+// =================================================================
+static void tcl_build_state(uint8_t state[TCL_STATE_BYTES],
+                             bool power, uint8_t mode, int temp_celsius,
+                             uint8_t fan, uint8_t swingv, bool light)
+{
+    memset(state, 0, TCL_STATE_BYTES);
+    state[0] = 0x23;
+    state[1] = 0xCB;
+    state[2] = 0x26;
+    state[3] = 0x01;
+    state[4] = 0x00;
+
+    uint8_t b5 = 0;
+    if (power) b5 |= (1 << 2);
+    if (light) b5 |= (1 << 6);
+    state[5] = b5;
+
+    state[6] = mode & 0x0F;
+
+    if (temp_celsius < 16) temp_celsius = 16;
+    if (temp_celsius > 31) temp_celsius = 31;
+    uint8_t temp_raw = (uint8_t)(31 - temp_celsius);
+    state[7] = temp_raw & 0x0F;
+
+    state[8] = (fan & 0x07) | ((swingv & 0x07) << 3);
+
+    state[9] = 0x00;
+    state[10] = 0x00;
+    state[11] = 0x00;
+    state[12] = 0x00;
+
+    uint8_t sum = 0;
+    for (int i = 0; i < TCL_STATE_BYTES - 1; i++) sum += state[i];
+    state[13] = sum;
+}
+
+static size_t tcl_state_to_symbols(const uint8_t state[TCL_STATE_BYTES],
+                                    rmt_symbol_word_t *symbols, size_t max_symbols)
+{
+    size_t idx = 0;
+    if (max_symbols < 1 + TCL_TOTAL_BITS + 1) {
+        ESP_LOGE(TAG, "Sembol buffer'i cok kucuk!");
+        return 0;
+    }
+
+    symbols[idx].level0 = 1;
+    symbols[idx].duration0 = TCL_HDR_MARK;
+    symbols[idx].level1 = 0;
+    symbols[idx].duration1 = TCL_HDR_SPACE;
+    idx++;
+
+    for (int b = 0; b < TCL_STATE_BYTES; b++) {
+        for (int k = 0; k < 8; k++) {
+            uint8_t bit = (state[b] >> k) & 0x1;
+            symbols[idx].level0 = 1;
+            symbols[idx].duration0 = TCL_BIT_MARK;
+            symbols[idx].level1 = 0;
+            symbols[idx].duration1 = bit ? TCL_ONE_SPACE : TCL_ZERO_SPACE;
+            idx++;
+        }
+    }
+
+    symbols[idx].level0 = 1;
+    symbols[idx].duration0 = TCL_BIT_MARK;
+    symbols[idx].level1 = 0;
+    symbols[idx].duration1 = 0;
+    idx++;
+
+    return idx;
+}
+
+static esp_err_t tcl_send_command(bool power, uint8_t mode, int temp_celsius,
+                                   uint8_t fan, uint8_t swingv, bool light)
+{
+    uint8_t state[TCL_STATE_BYTES];
+    tcl_build_state(state, power, mode, temp_celsius, fan, swingv, light);
+
+    ESP_LOGI(TAG, "Gonderilecek paket:");
+    for (int i = 0; i < TCL_STATE_BYTES; i++) printf("0x%02X ", state[i]);
+    printf("\n");
+
+    static rmt_symbol_word_t tx_symbols[120];
+    size_t n = tcl_state_to_symbols(state, tx_symbols, 120);
+    if (n == 0) return ESP_FAIL;
+
+    rmt_transmit_config_t tx_config = { .loop_count = 0 };
+    esp_err_t err = rmt_transmit(tx_channel, copy_encoder, tx_symbols,
+                                  n * sizeof(rmt_symbol_word_t), &tx_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Gonderim hatasi: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(tx_channel, portMAX_DELAY));
+    ESP_LOGI(TAG, "Komut gonderildi! (%d sembol)", (int)n);
+    return ESP_OK;
+}
+
+static esp_err_t tcl_send_current_state(void)
+{
+    return tcl_send_command(g_ac_state.power, TCL_MODE_COOL, g_ac_state.temp,
+                             g_ac_state.fan, g_ac_state.swingv, false);
+}
+
+// =================================================================
+// YEREL HTTP SUNUCUSU
+// =================================================================
+static const char *HTML_PAGE =
+"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+"<title>Klima</title>"
+"<style>"
+"body{font-family:sans-serif;text-align:center;background:#111;color:#eee;padding:20px}"
+"button{font-size:22px;padding:16px 20px;margin:6px;border-radius:10px;border:none;min-width:80px}"
+".on{background:#2ecc71;color:#000}"
+".off{background:#e74c3c;color:#fff}"
+".temp{background:#f1c40f;color:#000;font-size:30px}"
+".fan{background:#3498db;color:#fff}"
+".swing{background:#9b59b6;color:#fff}"
+"#tempval{font-size:36px;margin:0 12px}"
+"#status{margin-top:20px;font-size:16px;color:#aaa}"
+"h3{margin-top:25px;margin-bottom:8px;color:#888;font-weight:normal}"
+"</style></head><body>"
+"<h2>Klima Kontrol</h2>"
+"<div><button class='on' onclick=\"cmd('power=on')\">AC</button>"
+"<button class='off' onclick=\"cmd('power=off')\">KAPAT</button></div>"
+"<div style='margin-top:15px'>"
+"<button class='temp' onclick=\"cmd('temp=down')\">-</button>"
+"<span id='tempval'>24</span>C"
+"<button class='temp' onclick=\"cmd('temp=up')\">+</button></div>"
+"<h3>Fan Hizi</h3>"
+"<div>"
+"<button class='fan' onclick=\"cmd('fan=auto')\">Auto</button>"
+"<button class='fan' onclick=\"cmd('fan=low')\">Dusuk</button>"
+"<button class='fan' onclick=\"cmd('fan=med')\">Orta</button>"
+"<button class='fan' onclick=\"cmd('fan=high')\">Yuksek</button>"
+"</div>"
+"<h3>Salinim</h3>"
+"<div>"
+"<button class='swing' onclick=\"cmd('swing=on')\">Salinim Ac</button>"
+"<button class='swing' onclick=\"cmd('swing=off')\">Salinim Kapa</button>"
+"</div>"
+"<div id='status'>Hazir</div>"
+"<script>"
+"let temp=24;"
+"function cmd(q){"
+"  if(q.startsWith('temp=up')) temp++;"
+"  if(q.startsWith('temp=down')) temp--;"
+"  if(temp<16)temp=16; if(temp>31)temp=31;"
+"  document.getElementById('tempval').innerText=temp;"
+"  let url='/cmd?'+q+'&tempval='+temp;"
+"  document.getElementById('status').innerText='Gonderiliyor...';"
+"  fetch(url).then(r=>r.text()).then(t=>{document.getElementById('status').innerText=t;});"
+"}"
+"</script></body></html>";
+
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static bool get_query_param(httpd_req_t *req, const char *key, char *out, size_t out_len)
+{
+    char query[128];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
+    return httpd_query_key_value(query, key, out, out_len) == ESP_OK;
+}
+
+static esp_err_t cmd_get_handler(httpd_req_t *req)
+{
+    char val[32];
+
+    if (get_query_param(req, "power", val, sizeof(val))) {
+        g_ac_state.power = (strcmp(val, "on") == 0);
+    }
+    if (get_query_param(req, "tempval", val, sizeof(val))) {
+        int t = atoi(val);
+        if (t >= 16 && t <= 31) g_ac_state.temp = t;
+    }
+    if (get_query_param(req, "fan", val, sizeof(val))) {
+        if (!strcmp(val, "auto")) g_ac_state.fan = TCL_FAN_AUTO;
+        else if (!strcmp(val, "low"))  g_ac_state.fan = TCL_FAN_LOW;
+        else if (!strcmp(val, "med"))  g_ac_state.fan = TCL_FAN_MED;
+        else if (!strcmp(val, "high")) g_ac_state.fan = TCL_FAN_HIGH;
+    }
+    if (get_query_param(req, "swing", val, sizeof(val))) {
+        if (!strcmp(val, "on"))  g_ac_state.swingv = TCL_SWINGV_ON;
+        else if (!strcmp(val, "off")) g_ac_state.swingv = TCL_SWINGV_OFF;
+    }
+
+    esp_err_t err = tcl_send_current_state();
+
+    char resp[80];
+    snprintf(resp, sizeof(resp), "%s | P:%d T:%d F:%d S:%d",
+             err == ESP_OK ? "OK" : "HATA",
+             g_ac_state.power, g_ac_state.temp, g_ac_state.fan, g_ac_state.swingv);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.lru_purge_enable = true;
+
+    ESP_ERROR_CHECK(httpd_start(&server, &config));
+
+    httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
+    httpd_register_uri_handler(server, &root_uri);
+
+    httpd_uri_t cmd_uri = { .uri = "/cmd", .method = HTTP_GET, .handler = cmd_get_handler };
+    httpd_register_uri_handler(server, &cmd_uri);
+
+    return server;
+}
+
+// =================================================================
+// THINGSPEAK POLLING (uzaktan kontrol)
+// =================================================================
+static char ts_response_buf[512];
+static int ts_response_len = 0;
+
+static esp_err_t ts_http_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        if (ts_response_len + evt->data_len < (int)sizeof(ts_response_buf) - 1) {
+            memcpy(ts_response_buf + ts_response_len, evt->data, evt->data_len);
+            ts_response_len += evt->data_len;
+            ts_response_buf[ts_response_len] = '\0';
+        }
+    }
+    return ESP_OK;
+}
+
+static void thingspeak_poll_task(void *pvParameters)
+{
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://api.thingspeak.com/channels/%s/feeds/last.json?api_key=%s",
+             THINGSPEAK_CHANNEL_ID, THINGSPEAK_READ_API_KEY);
+
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    while (1) {
+        ts_response_len = 0;
+        ts_response_buf[0] = '\0';
+
+        esp_http_client_config_t config = {
+            .url = url,
+            .event_handler = ts_http_event_handler,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .timeout_ms = 8000,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        esp_err_t err = esp_http_client_perform(client);
+
+        if (err == ESP_OK && ts_response_len > 0) {
+            cJSON *root = cJSON_Parse(ts_response_buf);
+            if (root) {
+                cJSON *f1 = cJSON_GetObjectItem(root, "field1");
+                cJSON *f2 = cJSON_GetObjectItem(root, "field2");
+                cJSON *f3 = cJSON_GetObjectItem(root, "field3");
+                cJSON *f4 = cJSON_GetObjectItem(root, "field4");
+
+                bool new_power    = g_ac_state.power;
+                int  new_temp     = g_ac_state.temp;
+                uint8_t new_fan   = g_ac_state.fan;
+                uint8_t new_swing = g_ac_state.swingv;
+
+                if (cJSON_IsString(f1) && f1->valuestring) new_power = (atoi(f1->valuestring) != 0);
+                if (cJSON_IsString(f2) && f2->valuestring) {
+                    int t = atoi(f2->valuestring);
+                    if (t >= 16 && t <= 31) new_temp = t;
+                }
+                if (cJSON_IsString(f3) && f3->valuestring) new_fan = (uint8_t)atoi(f3->valuestring);
+                if (cJSON_IsString(f4) && f4->valuestring) new_swing = (uint8_t)atoi(f4->valuestring);
+
+                if (new_power != g_ac_state.power || new_temp != g_ac_state.temp ||
+                    new_fan != g_ac_state.fan || new_swing != g_ac_state.swingv) {
+                    ESP_LOGI(TAG, "ThingSpeak'ten yeni komut: P=%d T=%d F=%d S=%d",
+                             new_power, new_temp, new_fan, new_swing);
+                    g_ac_state.power = new_power;
+                    g_ac_state.temp = new_temp;
+                    g_ac_state.fan = new_fan;
+                    g_ac_state.swingv = new_swing;
+                    tcl_send_current_state();
+                }
+                cJSON_Delete(root);
+            } else {
+                ESP_LOGW(TAG, "ThingSpeak JSON parse hatasi: %s", ts_response_buf);
+            }
+        } else {
+            ESP_LOGW(TAG, "ThingSpeak istegi basarisiz: %s", esp_err_to_name(err));
+        }
+        esp_http_client_cleanup(client);
+
+        vTaskDelay(pdMS_TO_TICKS(THINGSPEAK_POLL_INTERVAL_MS));
+    }
+}
+
+// =================================================================
+// WiFi STA
+// =================================================================
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Baglanti koptu, tekrar deneniyor...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "IP alindi: " IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_STA_SSID,
+            .password = WIFI_STA_PASS,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi baslatildi, '%s' agina baglaniliyor...", WIFI_STA_SSID);
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                                            pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "WiFi baglantisi basarili!");
+    } else {
+        ESP_LOGE(TAG, "WiFi baglantisi zaman asimina ugradi! SSID/sifreyi kontrol edin.");
+    }
+}
+
+static void ir_tx_init(void)
+{
+    rmt_tx_channel_config_t tx_channel_cfg = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = IR_RESOLUTION_HZ,
+        .mem_block_symbols = 64,
+        .gpio_num = IR_TX_GPIO_NUM,
+        .trans_queue_depth = 4,
+        .flags.invert_out = false,
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_channel_cfg, &tx_channel));
+
+    rmt_carrier_config_t carrier_cfg = { .frequency_hz = 38000, .duty_cycle = 0.33 };
+    ESP_ERROR_CHECK(rmt_apply_carrier(tx_channel, &carrier_cfg));
+
+    rmt_copy_encoder_config_t copy_encoder_cfg = {};
+    ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_encoder_cfg, &copy_encoder));
+
+    ESP_ERROR_CHECK(rmt_enable(tx_channel));
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "TCL112AC WiFi+ThingSpeak Kontrolcusu baslatiliyor...");
+
+    ESP_ERROR_CHECK(nvs_flash_init());
+
+    wifi_init_sta();
+    ir_tx_init();
+    start_webserver();
+
+    xTaskCreate(thingspeak_poll_task, "ts_poll", 8192, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "Hazir! Yerelde web sayfasi, uzaktan ThingSpeak calisiyor.");
+}
+```
+
+---
+
+## 10. GitHub Pages — index.html (Tam Kod)
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Klima Uzaktan Kontrol</title>
+<style>
+body{font-family:sans-serif;text-align:center;background:#111;color:#eee;padding:20px}
+button{font-size:22px;padding:16px 20px;margin:6px;border-radius:10px;border:none;min-width:80px}
+.on{background:#2ecc71;color:#000}
+.off{background:#e74c3c;color:#fff}
+.temp{background:#f1c40f;color:#000;font-size:30px}
+.fan{background:#3498db;color:#fff}
+.swing{background:#9b59b6;color:#fff}
+#tempval{font-size:36px;margin:0 12px}
+#status{margin-top:20px;font-size:16px;color:#aaa}
+h3{margin-top:25px;margin-bottom:8px;color:#888;font-weight:normal}
+</style>
+</head>
+<body>
+<h2>Klima Uzaktan Kontrol</h2>
+<div>
+  <button class="on" onclick="sendField(1,1)">AC</button>
+  <button class="off" onclick="sendField(1,0)">KAPAT</button>
+</div>
+<div style="margin-top:15px">
+  <button class="temp" onclick="changeTemp(-1)">-</button>
+  <span id="tempval">24</span>C
+  <button class="temp" onclick="changeTemp(1)">+</button>
+</div>
+<h3>Fan Hizi</h3>
+<div>
+  <button class="fan" onclick="sendField(3,0)">Auto</button>
+  <button class="fan" onclick="sendField(3,2)">Dusuk</button>
+  <button class="fan" onclick="sendField(3,3)">Orta</button>
+  <button class="fan" onclick="sendField(3,5)">Yuksek</button>
+</div>
+<h3>Salinim</h3>
+<div>
+  <button class="swing" onclick="sendField(4,7)">Salinim Ac</button>
+  <button class="swing" onclick="sendField(4,0)">Salinim Kapa</button>
+</div>
+<div id="status">Hazir</div>
+
+<script>
+const WRITE_API_KEY = "YAZMA_API_KEYINIZ"; // <-- BURAYA THINGSPEAK WRITE API KEY YAZIN
+let temp = 24;
+
+function setStatus(msg) {
+  document.getElementById('status').innerText = msg;
+}
+
+function sendField(fieldNum, value) {
+  const url = `https://api.thingspeak.com/update?api_key=${WRITE_API_KEY}&field${fieldNum}=${value}`;
+  setStatus('Gonderiliyor...');
+  fetch(url)
+    .then(r => r.text())
+    .then(t => {
+      if (t === "0") {
+        setStatus('HATA: ThingSpeak kabul etmedi (15sn bekleyip tekrar deneyin)');
+      } else {
+        setStatus('Gonderildi (kayit #' + t + ')');
+      }
+    })
+    .catch(e => setStatus('Baglanti hatasi: ' + e));
+}
+
+function changeTemp(delta) {
+  temp += delta;
+  if (temp < 16) temp = 16;
+  if (temp > 31) temp = 31;
+  document.getElementById('tempval').innerText = temp;
+  sendField(2, temp);
+}
+</script>
+</body>
+</html>
+```
+
+---
+
+## 11. Kritik Sabitler / Bağlantı Bilgileri (doldurulması gerekenler)
 ```c
 #define WIFI_STA_SSID   "MODEM_ADINIZ"
 #define WIFI_STA_PASS   "MODEM_SIFRENIZ"
 #define THINGSPEAK_CHANNEL_ID   "KANAL_ID_NIZ"
 #define THINGSPEAK_READ_API_KEY "OKUMA_API_KEYINIZ"
 ```
-GitHub Pages sayfasındaki `index.html` içinde:
+GitHub Pages `index.html` içinde:
 ```js
 const WRITE_API_KEY = "YAZMA_API_KEYINIZ";
 ```
