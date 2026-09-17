@@ -1,0 +1,69 @@
+# ESP32-C3 ile TCL Klima Kontrol Projesi — Özet Notlar
+
+## 1. Donanım
+- **MCU:** ESP32-C3 SuperMini (klon kart, seramik çip anten)
+- **IR Alıcı (RX):** GPIO4 üzerinde (capture/doğrulama için kullanıldı, artık gerekli değil)
+- **IR Verici (TX):** GPIO5 → 1k baz direnci → 2N2222 (NPN transistör) → 33Ω → IR LED → 5V
+- **Klima:** TCL SaveIN, model **TAC-18CHSD/ZG11I**
+
+## 2. Protokol: TCL112AC (doğrulandı)
+- 112 bit (14 byte), header + bit + footer sembol yapısı
+- Header: Mark ~3000µs, Space ~1650µs
+- Bit: Mark ~500µs, "1" Space ~1050µs, "0" Space ~325µs
+- Checksum: ilk 13 byte'ın 8-bit toplamı (byte 13)
+- İmza: `0x23 0xCB 0x26`
+
+### Byte Haritası
+| Byte | İçerik |
+|---|---|
+| 0-2 | Sabit imza (0x23 0xCB 0x26) |
+| 3 | MsgType (0x01 = Normal) |
+| 5 | bit2=Power, bit6=Light |
+| 6 | bit0-3=Mode (Cool=3, Heat=1, Dry=2, Fan=7, Auto=8) |
+| 7 | bit0-3=Temp (ham = 31 − °C) |
+| 8 | bit0-2=Fan (Auto=0, Düşük=2, Orta=3, Yüksek=5), bit3-5=SwingV (Kapalı=0, Açık=7) |
+| 13 | Checksum |
+
+**Not:** `Light` biti her paketle sabit `true` gönderildiğinde ekranı toggle'layıp yanlış görünüyordu → çözüm: `false` sabitlendi.
+
+## 3. Yazılım Mimarisi (main.c)
+- **WiFi:** STA modu, mevcut ev/iş modemine bağlanıyor (SoftAP'ta ESP32-C3 klon kartın anten sorunu nedeniyle ağ yayınlanamadığı için STA moduna geçildi)
+- **Yerel kontrol:** ESP32 üzerinde `esp_http_server` ile basit web sayfası (AC/KAPAT, sıcaklık +/-, fan hızı, salınım butonları) — sadece aynı WiFi ağındayken çalışır
+- **Uzaktan kontrol:** ThingSpeak entegrasyonu — ESP32, 20 saniyede bir kanalı okuyup değişiklik varsa IR komutu gönderiyor
+
+## 4. ThingSpeak Kurulumu
+- **Kanal field'ları:**
+  - `field1` = Power (0/1)
+  - `field2` = Sıcaklık (16-31)
+  - `field3` = Fan (0=Auto, 2=Düşük, 3=Orta, 5=Yüksek)
+  - `field4` = Salınım (0=Kapalı, 7=Açık)
+- ESP32 tarafı: `https://api.thingspeak.com/channels/<ID>/feeds/last.json?api_key=<READ_KEY>` adresini periyodik okuyor (cJSON ile parse)
+- Yazma (telefon/tarayıcı tarafı): `https://api.thingspeak.com/update?api_key=<WRITE_KEY>&field1=1&field2=24&field3=0&field4=0`
+- **Rate limit:** Ücretsiz hesapta minimum 15 saniyede bir güncelleme sınırı var
+
+## 5. Görsel Uzaktan Kontrol Arayüzü (GitHub Pages)
+- Statik HTML+JS sayfası, ThingSpeak Update API'sine doğrudan `fetch()` ile yazıyor
+- **Yayın adresi:** `garslanbay.github.io/klima-kontrol`
+- Telefonda "Ana Ekrana Ekle" ile uygulama gibi kullanılabiliyor
+- **Test sonucu:** Butona basınca "Gonderildi (kayit #...)" mesajı geldi → ThingSpeak'e yazma **başarılı**
+
+## 6. Şu An Doğrulanmamış / Bir Sonraki Kontrol
+- [ ] ESP32'nin ThingSpeak'ten okuyup **gerçekten klimaya IR komutu gönderdiği** henüz canlı test edilmedi (bilgisayar/seri monitör kapalıyken buton denendi). Bir sonraki seferde:
+  1. ESP32'yi çalışır halde bırakıp (USB güç yeterli, bilgisayara bağlı olmasına gerek yok)
+  2. GitHub Pages sayfasından bir komut gönderip
+  3. Klimanın fiziksel olarak tepki verip vermediğini (en fazla 20 saniye içinde) gözlemlemek gerekiyor
+
+## 7. Daha Önce Denenen Ama Şu An Kullanılmayan
+- **Mitsubishi136 protokolü** (iş yerindeki Mitsubishi Electric klima için, kumanda modeli: 001CP T7WE10714) — RX/TX tam doğrulandı (Power ve SwingV alanları gerçek cihazda test edildi), ancak proje şu an TCL klimaya odaklanmış durumda. İleride tekrar gerekirse bu protokol bilgisi de mevcut.
+
+## 8. Kritik Sabitler / Bağlantı Bilgileri (kod içinde placeholder olarak duruyor, doldurulması gerekenler)
+```c
+#define WIFI_STA_SSID   "MODEM_ADINIZ"
+#define WIFI_STA_PASS   "MODEM_SIFRENIZ"
+#define THINGSPEAK_CHANNEL_ID   "KANAL_ID_NIZ"
+#define THINGSPEAK_READ_API_KEY "OKUMA_API_KEYINIZ"
+```
+GitHub Pages sayfasındaki `index.html` içinde:
+```js
+const WRITE_API_KEY = "YAZMA_API_KEYINIZ";
+```
