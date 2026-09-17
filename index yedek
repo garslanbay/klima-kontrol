@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Klima Uzaktan Kontrol</title>
+<style>
+body{font-family:sans-serif;text-align:center;background:#111;color:#eee;padding:20px}
+button{font-size:22px;padding:16px 20px;margin:6px;border-radius:10px;border:none;min-width:80px}
+.on{background:#2ecc71;color:#000}
+.off{background:#e74c3c;color:#fff}
+.temp{background:#f1c40f;color:#000;font-size:30px}
+.fan{background:#3498db;color:#fff}
+.swing{background:#9b59b6;color:#fff}
+#tempval{font-size:36px;margin:0 12px}
+#status{margin-top:20px;font-size:16px;color:#aaa}
+h3{margin-top:25px;margin-bottom:8px;color:#888;font-weight:normal}
+</style>
+</head>
+<body>
+<h2>Klima Uzaktan Kontrol</h2>
+<div>
+  <button class="on" onclick="setPower(1)">AC</button>
+  <button class="off" onclick="setPower(0)">KAPAT</button>
+</div>
+<div style="margin-top:15px">
+  <button class="temp" onclick="changeTemp(-1)">-</button>
+  <span id="tempval">24</span>C
+  <button class="temp" onclick="changeTemp(1)">+</button>
+</div>
+<h3>Fan Hizi</h3>
+<div>
+  <button class="fan" onclick="setFan(0)">Auto</button>
+  <button class="fan" onclick="setFan(2)">Dusuk</button>
+  <button class="fan" onclick="setFan(3)">Orta</button>
+  <button class="fan" onclick="setFan(5)">Yuksek</button>
+</div>
+<h3>Salinim</h3>
+<div>
+  <button class="swing" onclick="setSwing(7)">Salinim Ac</button>
+  <button class="swing" onclick="setSwing(0)">Salinim Kapa</button>
+</div>
+<div id="status">Hazir</div>
+
+<script>
+const WRITE_API_KEY = "ODPBYH94R9T5MGN5"; // <-- BURAYA THINGSPEAK WRITE API KEY YAZIN
+
+// Klimanin su anki (bizim bildigimiz) durumu - butona her basista guncellenip TOPLU gonderilir
+let state = {
+  power: 0,
+  temp: 24,
+  fan: 0,
+  swing: 0
+};
+
+function setStatus(msg) {
+  document.getElementById('status').innerText = msg;
+}
+
+// Tum state'i TEK istekte, tum field'lari birlikte gonderir
+function sendAll() {
+  const url = `https://api.thingspeak.com/update?api_key=${WRITE_API_KEY}`
+            + `&field1=${state.power}`
+            + `&field2=${state.temp}`
+            + `&field3=${state.fan}`
+            + `&field4=${state.swing}`;
+
+  setStatus('Gonderiliyor...');
+  fetch(url)
+    .then(r => r.text())
+    .then(t => {
+      if (t === "0") {
+        setStatus('HATA: ThingSpeak kabul etmedi (15sn bekleyip tekrar deneyin)');
+      } else {
+        document.getElementById('tempval').innerText = state.temp;
+        setStatus('Gonderildi (kayit #' + t + ') | P:' + state.power +
+                   ' T:' + state.temp + ' F:' + state.fan + ' S:' + state.swing);
+      }
+    })
+    .catch(e => setStatus('Baglanti hatasi: ' + e));
+}
+
+function setPower(v) {
+  state.power = v;
+  sendAll();
+}
+
+function changeTemp(delta) {
+  state.temp += delta;
+  if (state.temp < 16) state.temp = 16;
+  if (state.temp > 31) state.temp = 31;
+  document.getElementById('tempval').innerText = state.temp; // aninda gorsel guncelleme
+  sendAll();
+}
+
+function setFan(v) {
+  state.fan = v;
+  sendAll();
+}
+
+function setSwing(v) {
+  state.swing = v;
+  sendAll();
+}
+</script>
+</body>
+</html>
