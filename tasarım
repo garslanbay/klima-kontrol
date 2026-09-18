@@ -596,7 +596,7 @@ h3{margin-top:25px;margin-bottom:8px;color:#888;font-weight:normal}
 <div id="status">Hazir</div>
 
 <script>
-const WRITE_API_KEY = "YAZMA_API_KEYINIZ"; // <-- BURAYA THINGSPEAK WRITE API KEY YAZIN
+const WRITE_API_KEY = "ODPBYH94R9T5MGN5"; // <-- BURAYA THINGSPEAK WRITE API KEY YAZIN
 let temp = 24;
 
 function setStatus(msg) {
